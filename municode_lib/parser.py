@@ -14,7 +14,7 @@ try:
 except ImportError:
     HAS_HTMLMIN = False
 
-from .models import Section, Document
+from .models import Section, Document, parse_section_title
 from .exceptions import ParsingError
 
 
@@ -82,6 +82,15 @@ class MunicodeParser:
                 result.append(new_el)
                 prev.extract()  # Remove the previous sibling
                 break
+
+            # if isinstance(prev, Tag) and keyword.lower() in prev.text.lower():
+            #     title = prev.text.strip()
+                
+            #     # Update hierarchy path
+            #     current_path[i] = title
+            #     for j in range(i + 1, len(current_path)):
+            #         current_path[j] = None  # Clear lower levels
+            #     break
 
         # Process child elements
         i = 0
@@ -175,11 +184,20 @@ class MunicodeParser:
             for chunk in soup.find_all("div", class_="chunk-content"):
                 chunk_data = self._process_chunk(chunk, soup, current_path)
                 
+                # Parse the title to extract id, label, and title components
+                section_id, label, parsed_title = parse_section_title(chunk_data["title"])
+                
+                # Include current section ID in path
+                section_path = chunk_data["path"].copy()
+                section_path.append(section_id)
+                
                 section = Section(
-                    title=chunk_data["title"],
+                    id=section_id,
+                    title=parsed_title,
+                    label=label,
                     content=chunk_data["content"],
-                    path=chunk_data["path"].copy(),
-                    level=len([p for p in chunk_data["path"] if p])
+                    path=section_path,
+                    url=source_url
                 )
                 sections.append(section)
             

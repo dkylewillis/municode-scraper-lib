@@ -13,14 +13,15 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 
-from .models import Section, Document
+from .models import Section, Document, parse_section_title
 from .exceptions import ScrapingError, InvalidUrlError, ElementNotFoundError
 
 
 class MunicodeScraper:
     """Web scraper for municode content."""
     
-    def __init__(self, headless: bool = True, timeout: int = 10, output_dir: str = "data"):
+    def __init__(self, headless: bool = True, timeout: int = 10, output_dir: str = "data",
+                 hierarchy_keywords: List[str] = None):
         """
         Initialize the scraper.
 
@@ -28,6 +29,7 @@ class MunicodeScraper:
             headless: Whether to run browser in headless mode
             timeout: Default timeout for element waits in seconds
             output_dir: Directory for output files
+            hierarchy_keywords: Keywords for hierarchy levels (default: ["Chapter", "Article", "Sec"])
         """
         self.headless = headless
         self.timeout = timeout
@@ -35,6 +37,7 @@ class MunicodeScraper:
         self.output_dir.mkdir(exist_ok=True)
         self.driver = None
         self.parsed_headings = []
+        self.hierarchy_keywords = hierarchy_keywords or ["Chapter", "Article", "Sec"]
         
     def __enter__(self):
         """Context manager entry point."""
@@ -86,10 +89,14 @@ class MunicodeScraper:
         except Exception:
             return False
 
-    def _parse_sections(self, url: str) -> List[Section]:
+    def _parse_sections(self, url: str, document_id: str) -> List[Section]:
         """Parse sections from a municode page."""
         sections = []
         print(f"🔗 Parsing {url}")
+        
+        # Initialize hierarchy tracking
+        current_hierarchy = [None] * len(self.hierarchy_keywords)  # Track current section at each level
+        current_hierarchy[0] = document_id  # Set root ID
         
         # Check if the url has already been parsed
         try:
@@ -117,19 +124,34 @@ class MunicodeScraper:
 
                 if chunks:
                     li_list = chunks.find_all('li')
-                    for li in li_list: 
+                    for i, li in enumerate(li_list): 
                         title_elem = li.find('div', class_='chunk-title')
                         if not title_elem:
                             continue
                         content_elem = li.find('div', class_='chunk-content')
                         
+                        # Parse the title to extract id, label, and title components
+                        full_title = title_elem.get_text(strip=True)
+                        section_id, label, parsed_title = parse_section_title(full_title)
+                        
+                        # Determine hierarchy level and update tree structure
+                        hierarchy_level = self._get_hierarchy_level(label)
+                        section_path = self._update_hierarchy_tree(
+                            current_hierarchy, hierarchy_level, section_id
+                        )
+                        
                         section = Section(
-                            title=title_elem.get_text(strip=True),
-                            title_html=str(title_elem),
+                            id=section_id,
+                            title=parsed_title,
+                            label=label,
                             content=str(content_elem) if content_elem else "",
+                            path=section_path.copy(),
                             url=url
                         )
                         sections.append(section)
+                        
+                        # Debug output
+                        print(f"📋 {label} -> Level {hierarchy_level} -> Path: {section_path}")
                         
         except Exception as e:
             print(f"❌ Error parsing {url}: {e}")
@@ -155,6 +177,67 @@ class MunicodeScraper:
         except Exception:
             return False
 
+    def _get_hierarchy_level(self, label: str) -> int:
+        """
+        Determine the hierarchy level of a section based on its label.
+        
+        Args:
+            label: Section label like "Chapter 22", "Article II", "Sec. 22-1"
+            
+        Returns:
+            Hierarchy level (0-based index) or -1 if not found
+        """
+        label_lower = label.lower()
+        
+        for level, keyword in enumerate(self.hierarchy_keywords):
+            if keyword.lower() in label_lower:
+                return level
+        
+        # If no keyword found, try to infer from common patterns
+        if any(word in label_lower for word in ['appendix', 'ap.', 'ap ', 'part']):
+            return 0
+        elif any(word in label_lower for word in ['chapter', 'ch.', 'ch ']):
+            return 1 if len(self.hierarchy_keywords) > 1 else 0
+        elif any(word in label_lower for word in ['article', 'art.', 'art ']):
+            return 2 if len(self.hierarchy_keywords) > 2 else 0
+        elif any(word in label_lower for word in ['section', 'sec.', 'sec ', '§']):
+            return 3 if len(self.hierarchy_keywords) > 3 else max(0, len(self.hierarchy_keywords) - 1)
+
+        # Default to the deepest level if no match found
+        return len(self.hierarchy_keywords) - 1
+
+    def _update_hierarchy_tree(self, current_hierarchy: List[Optional[str]], 
+                              level: int, section_id: str) -> List[str]:
+        """
+        Update the hierarchy tree and return the path for the current section.
+        
+        Args:
+            current_hierarchy: Current state of hierarchy (mutable)
+            level: Hierarchy level of current section (0-based)
+            section_id: ID of current section
+            
+        Returns:
+            Path list for current section (includes parent IDs + current section ID)
+        """
+        if level < 0 or level >= len(current_hierarchy):
+            # Invalid level, return path with just current section
+            return [section_id]
+        
+        # Update the hierarchy at this level
+        current_hierarchy[level] = section_id
+        
+        # Clear all deeper levels (sections that are now out of scope)
+        for i in range(level + 1, len(current_hierarchy)):
+            current_hierarchy[i] = None
+        
+        # Build path from parent levels AND include current level
+        path = []
+        for i in range(level + 1):  # Include current level
+            if current_hierarchy[i] is not None:
+                path.append(current_hierarchy[i])
+        
+        return path
+
     def scrape_section(self, url: str) -> Optional[Document]:
         """
         Scrape a single section and return Document object.
@@ -179,7 +262,7 @@ class MunicodeScraper:
             if not sections:
                 return None
             
-            title = sections[0].title if sections else "Unknown"
+            title = sections[0].label if sections else "Unknown"
             return Document(title=title, sections=sections, source_url=url)
 
         # Handle section with TOC
@@ -196,10 +279,11 @@ class MunicodeScraper:
         toc_url_list = [a.get_attribute('href') for a in a_tags]
         
         all_sections = []
-        title = a_tags[0].text if a_tags else "Chapter"
-        
+        title = a_tags[0].text if a_tags else "None"
+        document_id, _, _ = parse_section_title(title)
+
         for section_url in toc_url_list:
-            sections = self._parse_sections(section_url)
+            sections = self._parse_sections(section_url, document_id=document_id)
             if sections:
                 all_sections.extend(sections)
                 
